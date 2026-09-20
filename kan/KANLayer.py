@@ -1,27 +1,38 @@
-# KANLayer.py
 import torch
 import torch.nn as nn
 import numpy as np
 from .spline import extend_grid, coef2curve, curve2coef
 from .utils import sparse_mask
-from .basis import chebyshev_basis, rbf_basis, fit_lstsq
+from .basis import chebyshev_basis, rbf_basis, fit_lstsq, make_rbf_centers_batch
 
 
 class KANLayer(nn.Module):
     """
+    KANLayer class
+
     Базис выбирается параметром basis:
-      'bspline' : обычные B-сплайны (как раньше)
-      'cheb'    : полиномы Чебышева; grid = (in_dim, 2) = [x_min, x_max];
-                  coef = (in_dim, out_dim, degree+1)
-      'rbf'     : гауссовы RBF; grid = (in_dim, n_centers);
-                  coef = (in_dim, out_dim, n_centers); sigma — буфер
+      'bspline' : обычные B-сплайны. `num` = число интервалов сетки, `k` = порядок сплайна.
+      'cheb'    : полиномы Чебышева. `k` = степень полинома; `num`/`grid` игнорируются.
+                  grid хранит интервал [x_min, x_max] формы (in_dim, 2).
+      'rbf'     : гауссовы RBF. `k` = число центров; `num`/`grid` игнорируются.
+                  grid хранит интервал [x_min, x_max] формы (in_dim, 2);
+                  центры строятся из интервала:
+                    k=1 -> один центр в середине
+                    k=2 -> центры на [a, b]
+                    k>2 -> два на [a, b] + (k-2) равномерно между ними
+                  sigma — буфер, авто-масштабируется под интервал и число центров.
+
+    Общие атрибуты:
+        coef : (in_dim, out_dim, n_basis) — обучаемые коэффициенты
+        grid : (in_dim, ...) — узлы сетки (bspline) или интервал (cheb/rbf)
     """
+
     def __init__(self, in_dim=3, out_dim=2, num=5, k=3, noise_scale=0.5,
                  scale_base_mu=0.0, scale_base_sigma=1.0, scale_sp=1.0,
                  base_fun=torch.nn.SiLU(), grid_eps=0.02, grid_range=[-1, 1],
                  sp_trainable=True, sb_trainable=True, save_plot_data=True,
                  device='cpu', sparse_init=False,
-                 basis='bspline', degree=None, sigma=None):
+                 basis='bspline', sigma=None):
         super(KANLayer, self).__init__()
         self.out_dim = out_dim
         self.in_dim = in_dim
@@ -38,7 +49,8 @@ class KANLayer(nn.Module):
             self.coef = torch.nn.Parameter(curve2coef(self.grid[:, k:-k].permute(1, 0), noises, self.grid, k))
 
         elif basis == 'cheb':
-            self.degree = int(degree) if degree is not None else int(num)
+            # k — степень полинома
+            self.degree = int(k)
             grid = torch.zeros(in_dim, 2)
             grid[:, 0] = grid_range[0]
             grid[:, 1] = grid_range[1]
@@ -48,19 +60,22 @@ class KANLayer(nn.Module):
             )
 
         elif basis == 'rbf':
-            self.num_centers = int(num)
-            centers = torch.linspace(grid_range[0], grid_range[1], steps=self.num_centers)[None, :] \
-                        .expand(in_dim, self.num_centers).clone()
-            self.grid = torch.nn.Parameter(centers).requires_grad_(False)
+            # k — число центров
+            self.num_centers = int(k)
+            grid = torch.zeros(in_dim, 2)
+            grid[:, 0] = grid_range[0]
+            grid[:, 1] = grid_range[1]
+            self.grid = torch.nn.Parameter(grid).requires_grad_(False)
             if sigma is None:
-                if self.num_centers > 1:
-                    sigma = (grid_range[1] - grid_range[0]) / (self.num_centers - 1)
+                if self.num_centers == 1:
+                    sigma = (grid_range[1] - grid_range[0]) / 2.0
                 else:
-                    sigma = 1.0
+                    sigma = (grid_range[1] - grid_range[0]) / max(self.num_centers - 1, 1)
             self.register_buffer('sigma', torch.tensor(float(sigma)))
             self.coef = torch.nn.Parameter(
                 (torch.rand(in_dim, out_dim, self.num_centers) - 0.5) * noise_scale
             )
+
         else:
             raise ValueError(f"Unknown basis: {basis}")
 
@@ -87,14 +102,15 @@ class KANLayer(nn.Module):
     # --- ядро базиса --------------------------------------------------------
 
     def _eval_output(self, x):
-        """Возвращает (batch, in_dim, out_dim) — «сырой» выход базиса (без scale_base/scale_sp/mask)."""
+        """(batch, in_dim, out_dim) — «сырой» выход базиса (без scale_base/scale_sp/mask)."""
         if self.basis == 'bspline':
             return coef2curve(x_eval=x, grid=self.grid, coef=self.coef, k=self.k)
         elif self.basis == 'cheb':
             T = chebyshev_basis(x, self.grid[:, 0], self.grid[:, 1], self.degree)
             return torch.einsum('bic,ioc->bio', T, self.coef)
         elif self.basis == 'rbf':
-            B = rbf_basis(x, self.grid, self.sigma)
+            centers = make_rbf_centers_batch(self.num_centers, self.grid[:, 0], self.grid[:, 1])
+            B = rbf_basis(x, centers, self.sigma)
             return torch.einsum('bic,ioc->bio', B, self.coef)
 
     def _fit(self, x, y):
@@ -105,7 +121,8 @@ class KANLayer(nn.Module):
             T = chebyshev_basis(x, self.grid[:, 0], self.grid[:, 1], self.degree)
             return fit_lstsq(T, y)
         elif self.basis == 'rbf':
-            B = rbf_basis(x, self.grid, self.sigma)
+            centers = make_rbf_centers_batch(self.num_centers, self.grid[:, 0], self.grid[:, 1])
+            B = rbf_basis(x, centers, self.sigma)
             return fit_lstsq(B, y)
 
     # --- forward ------------------------------------------------------------
@@ -153,7 +170,6 @@ class KANLayer(nn.Module):
             self.coef.data = curve2coef(x_pos, y_eval, self.grid, self.k)
 
         elif self.basis == 'cheb':
-            # адаптируем домен к данным, затем переобучаем коэффициенты
             x_min, x_max = x_pos[0, :], x_pos[-1, :]
             old_min, old_max = self.grid.data[:, 0], self.grid.data[:, 1]
             new_min = self.grid_eps * old_min + (1 - self.grid_eps) * x_min
@@ -162,14 +178,15 @@ class KANLayer(nn.Module):
             self.coef.data = self._fit(x_pos, y_eval)
 
         elif self.basis == 'rbf':
-            # переставляем центры по квантилям и обновляем sigma
-            n_centers = self.num_centers
-            ids = [int(batch / n_centers * i) for i in range(n_centers)]
-            new_centers = x_pos[ids, :].permute(1, 0)
-            self.grid.data = self.grid_eps * self.grid.data + (1 - self.grid_eps) * new_centers
-            if n_centers > 1:
-                diffs = self.grid.data[:, 1:] - self.grid.data[:, :-1]
-                self.sigma.data = torch.abs(diffs).mean()
+            x_min, x_max = x_pos[0, :], x_pos[-1, :]
+            old_min, old_max = self.grid.data[:, 0], self.grid.data[:, 1]
+            new_min = self.grid_eps * old_min + (1 - self.grid_eps) * x_min
+            new_max = self.grid_eps * old_max + (1 - self.grid_eps) * x_max
+            self.grid.data = torch.stack([new_min, new_max], dim=1)
+            if self.num_centers == 1:
+                self.sigma.data = ((new_max - new_min).mean() / 2.0).detach()
+            else:
+                self.sigma.data = ((new_max - new_min) / (self.num_centers - 1)).mean().detach()
             self.coef.data = self._fit(x_pos, y_eval)
 
     def initialize_grid_from_parent(self, parent, x, mode='sample'):
@@ -181,7 +198,6 @@ class KANLayer(nn.Module):
             raise ValueError("parent and child must use the same basis")
 
         if self.basis == 'bspline':
-            # оригинальная логика интерполяции сетки родителя
             def get_grid(num_interval):
                 x_pos_p = parent.grid[:, parent.k:-parent.k]
                 sp2 = KANLayer(in_dim=1, out_dim=self.in_dim, k=1,
@@ -208,26 +224,12 @@ class KANLayer(nn.Module):
             self.coef.data = curve2coef(x_pos, y_eval, self.grid, self.k)
 
         elif self.basis == 'cheb':
-            # домен наследуем у родителя; degree может отличаться
             self.grid.data = parent.grid.data.clone()
             self.coef.data = self._fit(x_pos, y_eval_parent)
 
         elif self.basis == 'rbf':
-            if self.num_centers != parent.num_centers:
-                # интерполируем центры родителя на нужное число ядер
-                new_centers = torch.zeros(self.in_dim, self.num_centers, device=x.device)
-                for i in range(self.in_dim):
-                    new_centers[i] = torch.nn.functional.interpolate(
-                        parent.grid.data[i].view(1, 1, -1),
-                        size=self.num_centers, mode='linear', align_corners=True
-                    ).view(-1)
-                self.grid.data = new_centers
-                if self.num_centers > 1:
-                    diffs = new_centers[:, 1:] - new_centers[:, :-1]
-                    self.sigma.data = torch.abs(diffs).mean()
-            else:
-                self.grid.data = parent.grid.data.clone()
-                self.sigma.data = parent.sigma.data.clone()
+            self.grid.data = parent.grid.data.clone()
+            self.sigma.data = parent.sigma.data.clone()
             self.coef.data = self._fit(x_pos, y_eval_parent)
 
     # --- утилиты ------------------------------------------------------------
@@ -236,7 +238,6 @@ class KANLayer(nn.Module):
         spb = KANLayer(
             len(in_id), len(out_id), self.num, self.k, base_fun=self.base_fun,
             basis=self.basis,
-            degree=getattr(self, 'degree', None),
             sigma=float(self.sigma) if self.basis == 'rbf' else None,
         )
         spb.grid.data = self.grid[in_id]

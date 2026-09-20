@@ -2,15 +2,15 @@ from kan import KAN
 import torch
 import matplotlib.pyplot as plt
 
-i = 3
+i = 2
 
 match i:
     case 1:
         model = KAN(width=[2,5,1], grid=3, k=3, seed=42)
     case 2:
-        model = KAN(width=[2,5,1], grid=10, k=3, basis='cheb', seed=42)
+        model = KAN(width=[2,5,1], k=5, basis='cheb', seed=42)
     case 3:
-        model = KAN(width=[2,5,1], grid=10, k=10, basis='rbf', seed=42)
+        model = KAN(width=[2,5,1], k=5, basis='rbf', seed=42)
 
 
 
